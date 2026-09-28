@@ -102,7 +102,8 @@ if grep -qw 'bc250.cpuonline=0' /proc/cmdline; then
 fi
 
 for p in $PARKED_APICS; do
-    [[ $p =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 15 )) || die "bad PARKED_APICS entry '$p' in $CONF"
+    [[ $p =~ ^[0-9]+$ ]] && (( p <= 15 )) || die "bad PARKED_APICS entry '$p' in $CONF"
+    (( p >= 2 )) || die "PARKED_APICS contains $p: core 0 (APIC 0/1) holds the boot CPU and can't be parked — if core 0 is defective this method can't work on this board"
 done
 for p in $PARKED_APICS; do
     case " $PARKED_APICS " in *" $(( p ^ 1 )) "*) ;; *) die "PARKED_APICS must list both threads of a core (APIC $p without $(( p ^ 1 )))" ;; esac

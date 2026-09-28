@@ -12,7 +12,12 @@ every CPU **except** the defective core's two threads. On the reference board th
 It also fixes the missing CPU C-states / cpufreq that affect every BC-250 on the stock BIOS.
 
 > **7, not 8.** If all 8 of your cores are good, the upstream tools already do the job. This is for
-> boards where one isn't. Read the whole README first. You are poking undocumented SMU/firmware
+> boards where one isn't.
+>
+> **It can't help if core 0 is the bad one.** Under mask `0xFF` the firmware always boots on core 0
+> (APIC 0), so a defective core 0, or any defect that crashes the firmware's own startup rather than
+> Linux's CPU bring-up, hangs POST before GRUB or Linux runs. Parking only works for cores Linux
+> would otherwise bring up itself. Step 2 below detects this safely. Read the whole README first. You are poking undocumented SMU/firmware
 > interfaces on your own hardware. There is no warranty. See [LICENSE](LICENSE).
 
 ## How it fits together
@@ -90,9 +95,16 @@ sudo ./bc250-unlock-cores.py -f          # in your rw-r-r-0644/bc250-core-unlock
 `linux` line, then Ctrl-X. You'll boot on cpu0 only, with the mask at `0xFF`
 (`cat /sys/devices/system/cpu/possible` → `0-15`).
 
+**Stop condition:** if this warm reboot doesn't reach the GRUB menu (POST hangs, black/green screen),
+the problem is in core 0 or in the firmware's own bring-up, and **this method can't work on your board**.
+Power-cycle (PSU off ≥ 60 s) to get the factory mask back, remove `maxcpus=1`, and stop here.
+**Never install the shim (step 4) on such a board.** It would make every cold boot hang after its
+warm reset, and GRUB runs the hook before you could turn it off, so recovery would need a live USB.
+
 ### 3. Find the defective core(s)
 
-Test only the fused-off cores (zero bits of your factory mask):
+Test only the fused-off cores (zero bits of your factory mask). Core 0 can't be tested or parked,
+because it's the boot CPU (see the stop condition above).
 ```bash
 sudo sbin/bc250-core-test 3        # core 3 = cpu6/cpu7
 sudo sbin/bc250-core-test 5        # core 5 = cpu10/cpu11

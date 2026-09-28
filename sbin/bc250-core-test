@@ -15,7 +15,8 @@
 set -u
 N=${1:-}; SECS=${2:-120}
 SYS=/sys/devices/system/cpu
-[[ $N =~ ^[1-7]$ ]] || { echo "usage: $0 <core 1-7> [seconds]" >&2; exit 2; }
+[[ $N =~ ^[0-7]$ ]] || { echo "usage: $0 <core 1-7> [seconds]" >&2; exit 2; }
+(( N >= 1 )) || { echo "core 0 is the boot CPU: if you got this far, it works. If core 0 were defective, the warm reboot to mask 0xFF would already have hung in POST, and parking can't help then (see README)." >&2; exit 2; }
 (( EUID == 0 )) || { echo "needs root" >&2; exit 2; }
 command -v stress-ng >/dev/null || { echo "stress-ng not installed" >&2; exit 2; }
 
