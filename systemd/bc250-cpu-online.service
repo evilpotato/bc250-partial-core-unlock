@@ -1,0 +1,23 @@
+[Unit]
+Description=BC-250: online secondary CPUs, keep defective cores parked
+Documentation=https://github.com/evilpotato/bc250-partial-core-unlock
+# Early, before sysinit.target, so everything from basic.target on (irqbalance, tuned,
+# the GPU governor, anything that sizes itself by nproc) sees the final CPU set.
+# CPU hotplug is core kernel, so no module ordering is needed; we only need the script,
+# which lives under /usr/local -> /var/usrlocal (a separate /var mount on Bazzite).
+DefaultDependencies=no
+RequiresMountsFor=/var/usrlocal/sbin/bc250-cpu-online
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+ConditionKernelCommandLine=!bc250.cpuonline=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/usrlocal/sbin/bc250-cpu-online
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bc250-cpu-online
+
+[Install]
+WantedBy=sysinit.target

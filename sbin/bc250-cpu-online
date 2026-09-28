@@ -1,0 +1,144 @@
+#!/bin/bash
+# bc250-cpu-online — bring up secondary CPUs on an AMD BC-250 booted with maxcpus=1,
+# leaving the threads of known-defective cores offline ("parked").
+#
+# Modes, decided from the ACPI MADT (never from SMN/SMU):
+#   MADT lists exactly APIC 0-15 (core mask 0xFF, all 8 cores enabled)
+#       -> online every CPU except those whose APIC ID is in PARKED_APICS.
+#          Under 0xFF the logical CPU number equals the APIC ID; this is checked per CPU.
+#   MADT lists fewer IDs (factory/fused mask, e.g. 0x77 or 0xD7)
+#       -> fused-off cores are invisible, so online everything that is listed.
+#   anything unexpected -> online nothing, log loudly.
+#
+# Safety: CPUs are onlined in ascending order and each one's APIC ID is verified right after
+# it comes up; the first mismatch stops the run. Never reboots. Idempotent.
+# Kernel cmdline "bc250.cpuonline=0" disables it.
+#
+# Config: /etc/bc250-cpu-online.conf  (PARKED_APICS="10 11", or "none" if all 8 cores are good).
+# Mask-0xFF mode refuses to run without it, so a missing config can't online a bad core.
+# Usage:  bc250-cpu-online [--dry-run]
+
+set -u
+
+SYS=/sys/devices/system/cpu
+MADT=${BC250_MADT:-/sys/firmware/acpi/tables/APIC}   # override for testing only
+CONF=/etc/bc250-cpu-online.conf
+PARKED_APICS=""
+[ -r "$CONF" ] && . "$CONF"
+[ "$PARKED_APICS" = none ] && { PARKED_SET=1; PARKED_APICS=""; } || PARKED_SET=$([ -n "$PARKED_APICS" ] && echo 1 || echo 0)
+
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+# journald parses "<N>" priority prefixes on stdout; plain text for interactive use.
+# JOURNAL_STREAM is inherited by child shells, so compare it with our actual stdout.
+TO_JOURNAL=0
+[ -n "${JOURNAL_STREAM:-}" ] && [ "$(stat -Lc '%d:%i' /proc/$$/fd/1 2>/dev/null)" = "$JOURNAL_STREAM" ] && TO_JOURNAL=1
+log() {
+    local prio=$1; shift
+    if (( TO_JOURNAL )); then echo "<$prio>$*"; else echo "$*" >&2; fi
+}
+die() { log 2 "ABORT: $* — no further CPUs will be onlined"; exit 1; }
+
+apicid_of() {
+    awk -v c="$1" '/^processor/ {p=$3} /^apicid/ && p==c {print $3; exit}' /proc/cpuinfo
+}
+
+is_online() {
+    [ "$1" = 0 ] && return 0
+    [ "$(cat "$SYS/cpu$1/online" 2>/dev/null)" = 1 ]
+}
+
+# Fills MADT_EN (enabled LAPIC/x2APIC IDs, table order) and MADT_HP (online-capable but disabled).
+read_madt() {
+    MADT_EN=(); MADT_HP=()
+    local -a b
+    mapfile -t b < <(od -An -v -tu1 -w1 "$MADT" 2>/dev/null | tr -d ' ')
+    local n=${#b[@]} i=44 t l id flags
+    (( n >= 44 )) || { log 3 "MADT: cannot read $MADT (${n} bytes)"; return 1; }
+    [ "${b[0]} ${b[1]} ${b[2]} ${b[3]}" = "65 80 73 67" ] || { log 3 "MADT: bad signature"; return 1; }
+    while (( i + 1 < n )); do
+        t=${b[i]}; l=${b[i+1]}
+        (( l >= 2 && i + l <= n )) || { log 3 "MADT: malformed entry at offset $i"; return 1; }
+        case $t in
+            0)  id=${b[i+3]}
+                flags=$(( b[i+4] | b[i+5] << 8 | b[i+6] << 16 | b[i+7] << 24 )) ;;
+            9)  id=$(( b[i+4] | b[i+5] << 8 | b[i+6] << 16 | b[i+7] << 24 ))
+                flags=$(( b[i+8] | b[i+9] << 8 | b[i+10] << 16 | b[i+11] << 24 )) ;;
+            *)  i=$(( i + l )); continue ;;
+        esac
+        if (( flags & 1 )); then MADT_EN+=("$id")
+        elif (( flags & 2 )); then MADT_HP+=("$id")
+        fi
+        i=$(( i + l ))
+    done
+}
+
+sorted() { printf '%s\n' "$@" | sort -n | tr '\n' ' ' | sed 's/ $//'; }
+
+online_cpu() {
+    local n=$1 want=$2 got
+    if is_online "$n"; then
+        got=$(apicid_of "$n")
+        [ "$got" = "$want" ] || die "cpu$n already online with APIC $got, expected $want"
+        log 6 "cpu$n already online (APIC $got)"
+        return 0
+    fi
+    if (( DRY )); then
+        log 6 "[dry-run] would online cpu$n (expect APIC $want)"
+        return 0
+    fi
+    log 6 "onlining cpu$n (expect APIC $want)"
+    echo 1 > "$SYS/cpu$n/online" || die "writing $SYS/cpu$n/online failed"
+    got=$(apicid_of "$n")
+    [ "$got" = "$want" ] || die "cpu$n came up with APIC ${got:-?}, expected $want — mapping is not what we assumed"
+}
+
+# --- main -------------------------------------------------------------------
+
+if grep -qw 'bc250.cpuonline=0' /proc/cmdline; then
+    log 4 "disabled by kernel cmdline (bc250.cpuonline=0); leaving CPUs as they are"
+    exit 0
+fi
+
+for p in $PARKED_APICS; do
+    [[ $p =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 15 )) || die "bad PARKED_APICS entry '$p' in $CONF"
+done
+for p in $PARKED_APICS; do
+    case " $PARKED_APICS " in *" $(( p ^ 1 )) "*) ;; *) die "PARKED_APICS must list both threads of a core (APIC $p without $(( p ^ 1 )))" ;; esac
+done
+
+possible=$(cat "$SYS/possible")
+log 6 "possible=$possible online=$(cat "$SYS/online") parked=[${PARKED_APICS}]$( ((DRY)) && echo ' (dry-run)')"
+
+read_madt || die "cannot parse MADT"
+en=$(sorted "${MADT_EN[@]}")
+log 6 "MADT enabled APIC IDs: ${MADT_EN[*]}"
+(( ${#MADT_HP[@]} )) && die "MADT has online-capable (hotplug) APIC IDs: $(sorted "${MADT_HP[@]}") — unexpected"
+[ "$possible" = "0-$(( ${#MADT_EN[@]} - 1 ))" ] || die "possible=$possible does not match ${#MADT_EN[@]} MADT entries"
+[ "$(apicid_of 0)" = "${MADT_EN[0]}" ] || die "cpu0 is APIC $(apicid_of 0), expected ${MADT_EN[0]}"
+
+if [ "$en" = "$(seq -s ' ' 0 15)" ]; then
+    # Mask 0xFF: logical CPU n == APIC n (verified per CPU as it comes up).
+    (( PARKED_SET )) || die "mask 0xFF but PARKED_APICS is not set in $CONF (use \"none\" if every core is good)"
+    for p in $PARKED_APICS; do
+        is_online "$p" && die "cpu$p (parked) is ONLINE — was the kernel booted without maxcpus=1? Not touching anything"
+    done
+    log 5 "mode 0xFF: onlining all CPUs except parked APICs [${PARKED_APICS}]"
+    for n in $(seq 1 15); do
+        case " $PARKED_APICS " in *" $n "*) log 6 "cpu$n parked"; continue ;; esac
+        online_cpu "$n" "$n"
+    done
+elif (( ${#MADT_EN[@]} >= 2 && ${#MADT_EN[@]} < 16 && ${#MADT_EN[@]} % 2 == 0 )); then
+    # Factory/fused mask: fused-off cores are absent from the MADT, so every listed CPU is a
+    # core the factory kept. Logical CPU n takes the n-th MADT entry.
+    log 5 "mode factory mask (${#MADT_EN[@]} CPUs): onlining all listed CPUs"
+    for n in $(seq 1 $(( ${#MADT_EN[@]} - 1 ))); do
+        online_cpu "$n" "${MADT_EN[n]}"
+    done
+else
+    die "unrecognised MADT APIC set '$en'"
+fi
+
+log 5 "done: online=$(cat "$SYS/online")"
+exit 0

@@ -1,0 +1,52 @@
+#!/bin/bash
+# BC-250 7-core acceptance run: stress-ng verify + telemetry log + kernel-log check.
+# Usage: bc250-acceptance [minutes] [label]      (default 20 min; run without sudo)
+# For the combined test, start a GPU stress test (e.g. FurMark) first, then: bc250-acceptance 15 combined
+# GPU clock telemetry is broken with mask 0xFF, so GPU power draw is logged as the clock proxy.
+set -u
+MIN=${1:-20}
+LABEL=${2:-cpu}
+DIR=${BC250_RESULTS:-$HOME/bc250-results}
+mkdir -p "$DIR"
+STAMP=$(date +%Y%m%d-%H%M%S)
+LOG="$DIR/$STAMP-$LABEL-telemetry.csv"
+OUT="$DIR/$STAMP-$LABEL-stress.txt"
+HW=$(dirname "$(grep -l amdgpu /sys/class/drm/card*/device/hwmon/hwmon*/name | head -1)")
+K10=$(grep -l k10temp /sys/class/hwmon/hwmon*/name | head -1 | xargs dirname)
+KSTART=$(date '+%Y-%m-%d %H:%M:%S')
+
+PARKED_APICS=""; [ -r /etc/bc250-cpu-online.conf ] && . /etc/bc250-cpu-online.conf
+[ "$PARKED_APICS" = none ] && PARKED_APICS=""
+echo "online=$(cat /sys/devices/system/cpu/online)  nproc=$(nproc)  parked=[$PARKED_APICS]  log=$LOG"
+for p in $PARKED_APICS; do
+    [ "$(cat /sys/devices/system/cpu/cpu$p/online 2>/dev/null)" = 1 ] && { echo "parked cpu$p is ONLINE, aborting"; exit 1; }
+done
+
+echo "time,cpu_tctl_c,cpu_avg_mhz,gpu_temp_c,gpu_power_w,gov_min,gov_max" > "$LOG"
+(
+    while :; do
+        tctl=$(( $(cat "$K10/temp1_input") / 1000 ))
+        mhz=$(awk '/cpu MHz/ {s+=$4; n++} END {printf "%d", s/n}' /proc/cpuinfo)
+        gt=$(( $(cat "$HW/temp1_input") / 1000 ))
+        gp=$(awk '{printf "%.1f", $1/1000000}' "$HW/power1_average")
+        rng=$(busctl --system get-property com.cyanskillfish.Governor /com/cyanskillfish/Governor/Range/Current com.cyanskillfish.Governor.Range Min Max 2>/dev/null | awk '{printf "%s,", $2}')
+        echo "$(date +%T),$tctl,$mhz,$gt,$gp,${rng%,}" >> "$LOG"
+        sleep 10
+    done
+) &
+SAMPLER=$!
+trap 'kill $SAMPLER 2>/dev/null' EXIT
+
+stress-ng --cpu 14 --cpu-method all --verify -t "$(awk -v m="$MIN" 'BEGIN{printf "%d", m*60}')s" --metrics-brief 2>&1 | tee "$OUT"
+RC=${PIPESTATUS[0]}
+kill $SAMPLER 2>/dev/null
+
+echo
+echo "== summary ($LABEL, ${MIN} min)"
+echo "stress-ng exit code: $RC"
+grep -iE 'fail|untrustworthy|passed|skipped' "$OUT" | tail -5
+awk -F, 'NR>1 { if ($2>ct) ct=$2; if ($4>gt) gt=$4; if ($5>gp) gp=$5; if ($3>cm) cm=$3; n++ }
+         END { printf "samples=%d  max CPU Tctl=%d C  max avg CPU MHz=%d  max GPU temp=%d C  max GPU power=%.1f W\n", n, ct, cm, gt, gp }' "$LOG"
+echo "== kernel log since start (amdgpu reset / ring timeout / MCE / hangs / smpboot)"
+journalctl -k --since "$KSTART" --no-pager | grep -iE 'amdgpu.*(reset|timeout|fault|hang)|ring .* timeout|mce|machine check|hardware error|soft lockup|hung task|rcu.*stall|smpboot' || echo "(none)"
+echo "online after run: $(cat /sys/devices/system/cpu/online)"

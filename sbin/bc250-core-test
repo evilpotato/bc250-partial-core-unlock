@@ -1,0 +1,42 @@
+#!/bin/bash
+# bc250-core-test — find out whether one physical core is usable, under core mask 0xFF.
+#
+# Preconditions (see README "Finding your bad core"):
+#   * core mask is 0xFF (written with the unlock tool, then WARM reboot), so the MADT lists APIC 0-15
+#   * kernel booted with maxcpus=1 and bc250.cpuonline=0 (service skipped) -> only cpu0 online
+#
+# Usage: sudo bc250-core-test <core 1-7> [seconds]      (default 120 s of stress-ng --verify)
+#
+# Brings up the core's two threads (cpu 2N, 2N+1), runs stress-ng --verify pinned to them,
+# then takes them offline again. A defective core typically hard-hangs the machine the moment
+# it is onlined (green/black screen): power-cycle (PSU off >= 60 s restores the factory mask)
+# and record that core as bad. Filesystems are synced first. Never reboots anything itself.
+
+set -u
+N=${1:-}; SECS=${2:-120}
+SYS=/sys/devices/system/cpu
+[[ $N =~ ^[1-7]$ ]] || { echo "usage: $0 <core 1-7> [seconds]" >&2; exit 2; }
+(( EUID == 0 )) || { echo "needs root" >&2; exit 2; }
+command -v stress-ng >/dev/null || { echo "stress-ng not installed" >&2; exit 2; }
+
+A=$(( 2 * N )); B=$(( 2 * N + 1 ))
+[ "$(cat $SYS/possible)" = "0-15" ] || { echo "possible=$(cat $SYS/possible): core mask is not 0xFF, nothing to test" >&2; exit 1; }
+grep -qw 'maxcpus=1' /proc/cmdline || { echo "kernel not booted with maxcpus=1 — refusing" >&2; exit 1; }
+
+apicid_of() { awk -v c="$1" '/^processor/ {p=$3} /^apicid/ && p==c {print $3; exit}' /proc/cpuinfo; }
+
+echo "core $N = cpu$A + cpu$B. If the machine hangs now, core $N is defective."
+echo "syncing filesystems..."; sync; sleep 2
+for c in $A $B; do
+    if [ "$(cat $SYS/cpu$c/online)" != 1 ]; then
+        echo "onlining cpu$c"; echo 1 > $SYS/cpu$c/online || { echo "online cpu$c failed"; exit 1; }
+    fi
+    got=$(apicid_of $c)
+    [ "$got" = "$c" ] || { echo "cpu$c has APIC $got, expected $c — mapping differs, stopping"; echo 0 > $SYS/cpu$c/online; exit 1; }
+done
+echo "both threads up. running stress-ng --verify on cpu$A,$B for ${SECS}s..."
+stress-ng --cpu 2 --taskset "$A,$B" --cpu-method all --verify -t "${SECS}s" --metrics-brief 2>&1 | grep -E 'passed|failed|untrustworthy'
+rc=${PIPESTATUS[0]}
+for c in $B $A; do echo 0 > $SYS/cpu$c/online; done
+journalctl -k -b --no-pager | grep -iE 'mce|machine check|hardware error' | tail -3
+if (( rc == 0 )); then echo "RESULT: core $N looks GOOD (onlined, ${SECS}s verify clean)"; else echo "RESULT: core $N FAILED stress-ng verify (rc=$rc) — treat as defective"; fi

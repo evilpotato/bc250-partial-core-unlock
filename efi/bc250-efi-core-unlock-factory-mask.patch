@@ -1,0 +1,170 @@
+diff --git a/Makefile b/Makefile
+index d9b4203..4df8957 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,6 +3,9 @@ TARGET = bc250-unlock.efi
+ 
+ # Include directories for yoppeh-efi submodule (MIT Licensed)
+ INCLUDES = -I yoppeh-efi -DEFI_PLATFORM=1
++ifdef FACTORY_MASK
++INCLUDES += -DFACTORY_MASK=$(FACTORY_MASK)
++endif
+ 
+ # Detect OS and locate clang if on macOS
+ ifeq ($(shell uname), Darwin)
+diff --git a/main.c b/main.c
+index 6d734ec..9cd9d26 100644
+--- a/main.c
++++ b/main.c
+@@ -5,7 +5,15 @@
+ #endif
+ 
+ #define MASK_REG 0x0115A870
++// The board's factory core mask (e.g. 0x77, or 0xD7 = cores 3 and 5 fused off). Only this exact
++// value triggers the unlock; any other non-0xFF value is refused. Defective cores are then kept
++// offline by the OS (maxcpus=1 + bc250-cpu-online.service). Build with FACTORY_MASK=0x..
++#ifndef FACTORY_MASK
++#error "Define FACTORY_MASK (your board's factory core mask), e.g. make mingw FACTORY_MASK=0xD7"
++#endif
+ #define MSG_WRITE_FF 0x98
++// Q3 0x98 argument as used by rw-r-r-0644/bc250-unlock-cores.py, the path verified on this board
++#define MASK_WRITE_ARG 0x5A870
+ #define Q3_CMD 0x03B10A20
+ #define Q3_RSP 0x03B10A80
+ #define Q3_ARG 0x03B10A88
+@@ -13,6 +21,29 @@
+ // Set to 1 to halt the system after successful warm reboot validation instead of booting OS
+ #define TEST_MODE 0
+ 
++// Loop guard: a non-volatile flag set just before the warm reset. If we come back with the
++// mask still at FACTORY_MASK and the flag set, the write did not survive the reset, so we
++// give up for this boot instead of resetting again. Cleared once the mask reads 0xFF.
++#define EFI_VARIABLE_NON_VOLATILE 0x1
++#define EFI_VARIABLE_BOOTSERVICE_ACCESS 0x2
++#define EFI_VARIABLE_RUNTIME_ACCESS 0x4
++#define GUARD_ATTRS (EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS)
++static EFI_GUID guard_guid = {0x648e8930, 0x3211, 0x4c04, {0x8b, 0x0a, 0xb2, 0xde, 0x73, 0x68, 0x56, 0xcb}};
++static CHAR16 guard_name[] = L"BC250CoreUnlockTry";
++
++// Diagnostics: last outcome of a non-trivial run, readable from Linux as
++// /sys/firmware/efi/efivars/BC250CoreUnlockStatus-<guard guid> (4-byte attr header, then
++// code, mask before, mask after, mailbox status). Not written on plain 0xFF pass-through boots.
++#define ST_RESETTING   0x01  // mask written and read back as 0xFF, warm reset issued
++#define ST_UNLOCKED    0x10  // came back from our reset with mask 0xFF
++#define ST_E_TIMEOUT   0xE1  // SMU mailbox timeout
++#define ST_E_MAILBOX   0xE2  // Q3 0x98 returned non-OK status
++#define ST_E_READBACK  0xE3  // mask did not read 0xFF after the write
++#define ST_E_REVERTED  0xE4  // back at 0xD7 after our reset (loop guard tripped)
++#define ST_E_GUARD     0xE5  // could not set loop-guard variable
++#define ST_E_MASK      0xE6  // unexpected mask value
++static CHAR16 status_name[] = L"BC250CoreUnlockStatus";
++
+ // Freestanding helper routines for compiler intrinsic calls
+ void *memcpy(void *dest, const void *src, UINTN n) {
+     unsigned char *d = (unsigned char *)dest;
+@@ -106,6 +137,30 @@ void print_hex(EFI_SYSTEM_TABLE *SystemTable, unsigned int val) {
+     print(SystemTable, buf);
+ }
+ 
++static int guard_is_set(EFI_SYSTEM_TABLE *SystemTable) {
++    UINT8 val = 0;
++    UINTN size = sizeof(val);
++    UINT32 attrs = 0;
++    return SystemTable->RuntimeServices->GetVariable(guard_name, &guard_guid, &attrs, &size, &val) == EFI_SUCCESS;
++}
++
++static EFI_STATUS guard_set(EFI_SYSTEM_TABLE *SystemTable) {
++    UINT8 val = 1;
++    return SystemTable->RuntimeServices->SetVariable(guard_name, &guard_guid, GUARD_ATTRS, sizeof(val), &val);
++}
++
++static void status_set(EFI_SYSTEM_TABLE *SystemTable, UINT8 code, UINT8 before, UINT8 after, UINT8 mbox) {
++    UINT8 val[4] = {code, before, after, mbox};
++    SystemTable->RuntimeServices->SetVariable(status_name, &guard_guid, GUARD_ATTRS, sizeof(val), val);
++}
++
++static void guard_clear(EFI_SYSTEM_TABLE *SystemTable) {
++    // Only touch NVRAM when the flag exists, so ordinary warm boots cause no writes
++    if (guard_is_set(SystemTable)) {
++        SystemTable->RuntimeServices->SetVariable(guard_name, &guard_guid, GUARD_ATTRS, 0, NULL);
++    }
++}
++
+ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+     // Read mask register
+     unsigned int before = smn_rd(MASK_REG);
+@@ -120,17 +175,36 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+             __asm__ __volatile__("hlt");
+         }
+ #endif
++        if (guard_is_set(SystemTable)) {
++            status_set(SystemTable, ST_UNLOCKED, mask, mask, 0);
++            guard_clear(SystemTable);
++        }
+         // Cores are unlocked. Return EFI_SUCCESS to allow UEFI Boot Manager to proceed natively to option #2 in BootOrder!
+         return EFI_SUCCESS;
+-    } else if (mask == 0x77) {
++    } else if (mask == FACTORY_MASK) {
++        if (guard_is_set(SystemTable)) {
++            status_set(SystemTable, ST_E_REVERTED, mask, mask, 0);
++            guard_clear(SystemTable);
++            print(SystemTable, L"Error: core mask did not survive the warm reset! Not retrying; booting with factory mask.\r\n");
++            SystemTable->BootServices->Stall(5000000);
++            return EFI_LOAD_ERROR;
++        }
++        if (guard_set(SystemTable) != EFI_SUCCESS) {
++            status_set(SystemTable, ST_E_GUARD, mask, mask, 0);
++            print(SystemTable, L"Error: could not set loop-guard variable! Not unlocking.\r\n");
++            SystemTable->BootServices->Stall(5000000);
++            return EFI_LOAD_ERROR;
++        }
+ #if TEST_MODE
+         print(SystemTable, L"BC-250 Core Unlocker EFI Utility\r\n");
+-        print(SystemTable, L"Current Core Mask: 0x77\r\n");
+-        print(SystemTable, L"Mask is 0x77. Sending SMU message to unlock cores...\r\n");
++        print(SystemTable, L"Current Core Mask: 0xD7\r\n");
++        print(SystemTable, L"Mask is 0xD7. Sending SMU message to unlock cores...\r\n");
+ #endif
+-        int st = send_msg(SystemTable, MSG_WRITE_FF, MASK_REG);
++        int st = send_msg(SystemTable, MSG_WRITE_FF, MASK_WRITE_ARG);
+         if (st < 0) {
+             print(SystemTable, L"Error: SMU mailbox timeout!\r\n");
++            status_set(SystemTable, ST_E_TIMEOUT, mask, mask, 0);
++            guard_clear(SystemTable);
+             SystemTable->BootServices->Stall(5000000);
+             return EFI_LOAD_ERROR;
+         }
+@@ -138,17 +212,24 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+             print(SystemTable, L"Error: SMU Msg 0x98 returned status: ");
+             print_hex(SystemTable, st);
+             print(SystemTable, L"\r\n");
++            status_set(SystemTable, ST_E_MAILBOX, mask, mask, (UINT8)st);
++            guard_clear(SystemTable);
+             SystemTable->BootServices->Stall(5000000);
+             return EFI_LOAD_ERROR;
+         }
+-        
++
++        // Give the write time to land before reading back (as bc250-unlock-cores.py does)
++        SystemTable->BootServices->Stall(200000);
+         unsigned int after = smn_rd(MASK_REG);
+         if ((after & 0xFF) != 0xFF) {
+             print(SystemTable, L"Error: Core mask write failed to take effect!\r\n");
++            status_set(SystemTable, ST_E_READBACK, mask, after & 0xFF, (UINT8)st);
++            guard_clear(SystemTable);
+             SystemTable->BootServices->Stall(5000000);
+             return EFI_LOAD_ERROR;
+         }
+         
++        status_set(SystemTable, ST_RESETTING, mask, after & 0xFF, (UINT8)st);
+         // Instant warm reboot
+         SystemTable->RuntimeServices->ResetSystem(EfiResetWarm, EFI_SUCCESS, 0, NULL);
+         
+@@ -157,6 +238,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+         }
+     } else {
+         print(SystemTable, L"Error: Unexpected core mask! Aborting unlock to protect hardware.\r\n");
++        status_set(SystemTable, ST_E_MASK, mask, mask, 0);
+         print(SystemTable, L"Halting in 5 seconds...\r\n");
+         SystemTable->BootServices->Stall(5000000);
+         return EFI_LOAD_ERROR;
