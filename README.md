@@ -190,6 +190,6 @@ layout for 8 cores, which likely fixes this. Not tested here.
 ## Credits
 
 - [rw-r-r-0644](https://github.com/rw-r-r-0644/bc250-core-unlock): the core mask discovery and Q3 `0x98` write.
-- [Hexxeh](https://github.com/Hexxeh/bc250-efi-core-unlock): the EFI shim this patches (MIT).
+- [Hexxeh](https://github.com/Hexxeh/bc250-efi-core-unlock): the EFI shim this patches (MIT License, Copyright (c) 2026 Liam McLoughlin; the patch in `efi/` stays under those terms).
 - [mendesrr](https://github.com/mendesrr/bc250-acpi-fix-updated-8c) and contributors: the C/P-state SSDTs.
 - The cyan-skillfish-governor-smu and bc250-cu-live-manager authors, for the GPU side.
