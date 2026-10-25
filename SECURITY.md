@@ -3,7 +3,7 @@
 ## Security Maintainer
 
 - **Primary Maintainer:** Mike Rinaldi ([@evilpotato](https://github.com/evilpotato))
-- **Contact:** mrinaldi@gmail.com
+- **Contact:** Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/evilpotato/bc250-partial-core-unlock/security/advisories/new). Please do not open public issues for security reports.
 
 ## Scope and Security Context
 
